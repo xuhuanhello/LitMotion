@@ -108,7 +108,7 @@ namespace LitMotion
             }
             set
             {
-                MotionManager.GetDataRef(this).State.PlaybackSpeed = value;
+                MotionManager.GetDataRef(this).State.AssignPlaybackSpeed(value); // [fork] also ends Pause()/PlayBackwards()
             }
         }
 

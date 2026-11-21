@@ -22,6 +22,7 @@ namespace LitMotion
         [ReadOnly] public double DeltaTime;
         [ReadOnly] public double UnscaledDeltaTime;
         [ReadOnly] public double RealDeltaTime;
+        [ReadOnly] public uint EvaluationVersion; // [fork] version of the evaluations of this batch, see MotionData.MotionState.EvaluationVersion
 
         [WriteOnly] public NativeList<int>.ParallelWriter CompletedIndexList;
         [WriteOnly] public NativeArray<TValue> Output;
@@ -47,12 +48,14 @@ namespace LitMotion
 
                 var time = state.Time + deltaTime * state.PlaybackSpeed;
                 ptr->Update<TAdapter>(time, out var result);
+                state.EvaluationVersion = EvaluationVersion; // [fork]
                 Output[index] = result;
             }
             else if ((!state.IsPreserved && state.Status is MotionStatus.Completed) || state.Status is MotionStatus.Canceled)
             {
                 CompletedIndexList.AddNoResize(index);
                 state.Status = MotionStatus.Disposed;
+                state.EvaluationVersion = EvaluationVersion; // [fork] the removal belongs to this update, see MotionStorage.RemoveAll
             }
         }
     }

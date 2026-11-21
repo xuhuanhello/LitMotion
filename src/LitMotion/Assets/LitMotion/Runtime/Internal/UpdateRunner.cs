@@ -1,4 +1,3 @@
-using System;
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
 using Unity.Jobs;
@@ -47,6 +46,8 @@ namespace LitMotion
             prevUnscaledTime = unscaledTime;
             prevRealtime = realtime;
 
+            var evaluationVersion = MotionEvaluation.NextVersion(); // [fork]
+
             fixed (MotionData<TValue, TOptions>* dataPtr = storage.GetDataSpan())
             {
                 // update data
@@ -56,51 +57,17 @@ namespace LitMotion
                     DeltaTime = deltaTime,
                     UnscaledDeltaTime = unscaledDeltaTime,
                     RealDeltaTime = realDeltaTime,
+                    EvaluationVersion = evaluationVersion, // [fork]
                     Output = output,
                     CompletedIndexList = completedIndexList.AsParallelWriter()
                 };
                 job.Schedule(count, 16).Complete();
 
-                // invoke delegates
-                var managedDataSpan = storage.GetManagedDataSpan();
-                var outputPtr = (TValue*)output.GetUnsafePtr();
-                for (int i = 0; i < managedDataSpan.Length; i++)
-                {
-                    var currentDataPtr = dataPtr + i;
-                    ref var state = ref currentDataPtr->Core.State;
-
-                    if (state.IsInSequence) continue;
-
-                    var status = state.Status;
-                    ref var managedData = ref managedDataSpan[i];
-                    
-                    bool isPlaying   = status == MotionStatus.Playing;
-                    bool isCompleted = status == MotionStatus.Completed;
-                    bool isDelayed   = status == MotionStatus.Delayed;
-                    bool canUpdate = isPlaying || isCompleted || (isDelayed && !managedData.SkipValuesDuringDelay);
-                    bool loopComplete = (isPlaying || isCompleted || isDelayed) && state.WasLoopCompleted;
-                    if (canUpdate)
-                    {
-                        try
-                        {
-                            managedData.UpdateUnsafe(outputPtr[i]);
-                        }
-                        catch (Exception ex)
-                        {
-                            MotionDispatcher.GetUnhandledExceptionHandler()?.Invoke(ex);
-                            if (managedData.CancelOnError)
-                            {
-                                state.Status = MotionStatus.Canceled;
-                                managedData.OnCancelAction?.Invoke();
-                            }
-                        }
-                    }
-                    if (loopComplete) managedData.InvokeOnLoopComplete(state.CompletedLoops);
-                    if (isCompleted && state.WasStatusChanged) managedData.InvokeOnComplete();
-                }
+                // [fork] The batch contains exactly count outputs, including if a bind grows the storage.
+                storage.DispatchRunnerResults(dataPtr, (TValue*)output.GetUnsafePtr(), count, evaluationVersion);
             }
 
-            storage.RemoveAll(completedIndexList);
+            storage.RemoveAll(completedIndexList, evaluationVersion); // [fork] evaluationVersion: see MotionStorage.RemoveAll
         }
 
         public void Reset()

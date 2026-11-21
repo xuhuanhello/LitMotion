@@ -13,14 +13,44 @@ namespace LitMotion
         {
             public MotionStatus Status;
             public MotionStatus PrevStatus;
-            public bool IsPreserved;
-            public bool IsInSequence;
+            // [fork] Pack the original lifecycle flags into one byte. The other byte holds only
+            // playback modes: direct speed assignment can clear both with a single store.
+            const byte Preserved = 1, InSequence = 2;
+            const byte Paused = 1, Backwards = 2;
+            byte lifecycleFlags;
+            byte playbackModes;
+
+            public bool IsPreserved
+            {
+                readonly get => (lifecycleFlags & Preserved) != 0;
+                set => lifecycleFlags = value ? (byte)(lifecycleFlags | Preserved) : (byte)(lifecycleFlags & ~Preserved);
+            }
+            public bool IsInSequence
+            {
+                readonly get => (lifecycleFlags & InSequence) != 0;
+                set => lifecycleFlags = value ? (byte)(lifecycleFlags | InSequence) : (byte)(lifecycleFlags & ~InSequence);
+            }
+            public readonly bool IsPaused => (playbackModes & Paused) != 0 && PlaybackSpeed == 0f;
+            public readonly bool IsPlayingBackwards => (playbackModes & Backwards) != 0;
+            public void SetPaused() => playbackModes |= Paused;
+            public void ClearPaused() => playbackModes &= unchecked((byte)~Paused);
+            public void SetPlayingBackwards() => playbackModes |= Backwards;
+            public void ClearPlayingBackwards() => playbackModes &= unchecked((byte)~Backwards);
+            public void AssignPlaybackSpeed(float value)
+            {
+                PlaybackSpeed = value;
+                playbackModes = 0;
+            }
 
             public ushort CompletedLoops;
             public ushort PrevCompletedLoops;
 
             public double Time;
             public float PlaybackSpeed;
+
+            // [fork] Changes every time the motion is evaluated (by the update job, SetTime, Complete, Cancel).
+            // Lets an evaluation that runs user code detect that it has been superseded. See MotionEvaluation.
+            public uint EvaluationVersion;
 
             public readonly bool WasStatusChanged => Status != PrevStatus;
             public readonly bool WasLoopCompleted => CompletedLoops > PrevCompletedLoops;

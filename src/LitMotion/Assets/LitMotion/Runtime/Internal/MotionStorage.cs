@@ -4,9 +4,9 @@
 
 using System;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices; // [fork] single-evaluation spans
 using LitMotion.Collections;
 using Unity.Collections;
-using Unity.Collections.LowLevel.Unsafe;
 
 namespace LitMotion
 {
@@ -27,7 +27,11 @@ namespace LitMotion
         void Cancel(MotionHandle handle, bool checkIsInSequence = true);
         void Complete(MotionHandle handle, bool checkIsInSequence = true);
         void SetTime(MotionHandle handle, double time, bool checkIsInSequence = true);
-        ref MotionData GetDataRef(MotionHandle handle, bool checkIsInSequence = true);
+        void StopAtStart(MotionHandle handle); // [fork]
+        bool HasSlot(int index); // [fork]
+        MotionEvaluation CaptureEvaluation(MotionHandle handle); // [fork]
+        bool IsCurrent(in MotionEvaluation evaluation); // [fork]
+        ref MotionData GetDataRef(in MotionHandle handle, bool checkIsInSequence = true); // [fork] forward the readonly handle
         ref ManagedMotionData GetManagedDataRef(MotionHandle handle, bool checkIsInSequence = true);
         void AddToSequence(MotionHandle handle, out double motionDuration);
         MotionDebugInfo GetDebugInfo(MotionHandle handle);
@@ -50,6 +54,7 @@ namespace LitMotion
         ManagedMotionData[] managedDataArray = new ManagedMotionData[InitialCapacity];
         AllocatorHelper<RewindableAllocator> allocator;
         int tail;
+        int generation; // [fork] incremented by Reset(), see MotionEvaluation
 
         public MotionStorage(int id)
         {
@@ -91,8 +96,9 @@ namespace LitMotion
 
             state.Status = MotionStatus.Scheduled;
             state.Time = 0;
-            state.PlaybackSpeed = 1f;
+            state.AssignPlaybackSpeed(1f); // [fork] initialize speed and clear playback modes
             state.IsPreserved = false;
+            state.EvaluationVersion = MotionEvaluation.NextVersion(); // [fork]
 
             parameters.TimeKind = buffer.TimeKind;
             parameters.Duration = buffer.Duration;
@@ -127,6 +133,7 @@ namespace LitMotion
             managedDataRef.OnLoopCompleteAction = buffer.OnLoopCompleteAction;
             managedDataRef.OnCancelAction = buffer.OnCancelAction;
             managedDataRef.OnCompleteAction = buffer.OnCompleteAction;
+            managedDataRef.Extension = new MotionExtensionData(buffer.OnStartAction); // [fork]
             managedDataRef.StateCount = buffer.StateCount;
             managedDataRef.State0 = buffer.State0;
             managedDataRef.State1 = buffer.State1;
@@ -174,6 +181,8 @@ namespace LitMotion
         {
             tail--;
 
+            MotionExtensionHooks.OnRemoved(ref managedDataArray[denseIndex]); // [fork] releases the SetTarget registration
+
             // swap elements
             unmanagedDataArray[denseIndex] = unmanagedDataArray[tail];
             unmanagedDataArray[tail] = default;
@@ -199,7 +208,8 @@ namespace LitMotion
             }
         }
 
-        public void RemoveAll(NativeList<int> denseIndexList)
+        /// <param name="evaluationVersion">[fork] Version given by the job to the motions of this update (see MotionEvaluation).</param>
+        public void RemoveAll(NativeList<int> denseIndexList, uint evaluationVersion)
         {
             var list = new NativeArray<SparseIndex>(denseIndexList.Length, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
             for (int i = 0; i < list.Length; i++)
@@ -209,7 +219,13 @@ namespace LitMotion
 
             for (int i = 0; i < list.Length; i++)
             {
-                RemoveAt(sparseSetCore.GetSlotRefUnchecked(list[i].Index).DenseIndex);
+                var denseIndex = sparseSetCore.GetSlotRefUnchecked(list[i].Index).DenseIndex;
+
+                // [fork] A guarded motion that a callback of this update evaluated again (e.g. moved back to life) is not removed.
+                if (!IsDenseIndexOutOfRange(denseIndex) && managedDataArray[denseIndex].Extension.IsGuarded &&
+                    !IsCurrent(EvaluationAt(denseIndex, evaluationVersion), ref denseIndex)) continue;
+
+                RemoveAt(denseIndex);
             }
         }
 
@@ -290,6 +306,7 @@ namespace LitMotion
             }
 
             state.Status = MotionStatus.Canceled;
+            state.EvaluationVersion = MotionEvaluation.NextVersion(); // [fork] supersedes the evaluations in progress
 
             ref var managedData = ref managedDataArray[denseIndex];
             managedData.InvokeOnCancel();
@@ -317,6 +334,8 @@ namespace LitMotion
                     return;
                 case 4:
                     throw new InvalidOperationException("Complete was ignored because it is not possible to complete a motion that loops infinitely. If you want to end the motion, call Cancel() instead.");
+                // case 5 [fork]: a callback (OnStart, the bind, OnLoopComplete) moved, canceled or completed the motion
+                // before this completion ended: TryComplete() returns false, Complete() does not throw.
             }
         }
 
@@ -348,29 +367,50 @@ namespace LitMotion
                 return 4;
             }
 
+            // [fork] shared dispatch, see Dispatch()
+            var denseIndex = slot.DenseIndex;
+            dataRef.Core.State.EvaluationVersion = MotionEvaluation.NextVersion();
+            var evaluation = BeginEvaluation(denseIndex);
+
+            // OnStart (if the motion has not started yet) runs before the motion is marked as completed.
+            if (evaluation.IsGuarded && managedDataArray[denseIndex].Extension.OnStart != null)
+            {
+                if (!InvokeOnStart(evaluation, ref denseIndex)) return 5;
+                dataRef = ref unmanagedDataArray[denseIndex];
+            }
+
             dataRef.Complete<TAdapter>(out var result);
 
-            ref var managedData = ref managedDataArray[slot.DenseIndex];
-            try
-            {
-                managedData.UpdateUnsafe(result);
-            }
-            catch (Exception ex)
-            {
-                MotionDispatcher.GetUnhandledExceptionHandler()?.Invoke(ex);
-            }
-
-            if (state.WasLoopCompleted)
-            {
-                managedData.InvokeOnLoopComplete(state.CompletedLoops);
-            }
-
-            managedData.InvokeOnComplete();
-
-            return 0;
+            // As in v2.0.2, the managed entry is read after the evaluation: the adapter may have grown the storage (new arrays).
+            // (A guarded evaluation re-reads it anyway after checking that it is still current.)
+            ref var managedData = ref managedDataArray[evaluation.IsGuarded ? denseIndex : slot.DenseIndex];
+            return Dispatch(new EvaluatedDispatch(MotionEvaluationEntry.Complete, evaluation), denseIndex, ref dataRef, ref managedData, result) ? 0 : 5;
         }
 
-        public unsafe void SetTime(MotionHandle handle, double time, bool checkIsInSequence = true)
+        public void SetTime(MotionHandle handle, double time, bool checkIsInSequence = true)
+        {
+            SetTime(handle, time, checkIsInSequence, false); // [fork]
+        }
+
+        /// <summary>
+        /// [fork] Whether a slot exists at this index (a handle built by hand may have any index).
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool HasSlot(int index)
+        {
+            return index >= 0 && index < sparseSetCore.Capacity;
+        }
+
+        /// <summary>
+        /// [fork] PlayBackwards() on a motion that is at (or before) its start: evaluates it at its start and binds the value,
+        /// even in a delay with SkipValuesDuringDelay (as the runner does when it reaches the start, see Dispatch()).
+        /// </summary>
+        public void StopAtStart(MotionHandle handle)
+        {
+            SetTime(handle, MotionExtensionHooks.GetStartTime(ref GetDataRef(handle)), checkIsInSequence: true, bindAlways: true);
+        }
+
+        void SetTime(MotionHandle handle, double time, bool checkIsInSequence, bool bindAlways) // [fork] bindAlways
         {
             ref var slot = ref sparseSetCore.GetSlotRefUnchecked(handle.Index);
 
@@ -380,46 +420,302 @@ namespace LitMotion
             var version = slot.Version;
             if (version <= 0 || version != handle.Version) Error.MotionNotExists();
 
-            fixed (MotionData<TValue, TOptions>* arrayPtr = unmanagedDataArray)
+            ref var dataRef = ref unmanagedDataArray[denseIndex];
+            if (checkIsInSequence && dataRef.Core.State.IsInSequence) Error.MotionIsInSequence();
+
+            // [fork] shared dispatch, see Dispatch()
+            dataRef.Core.State.EvaluationVersion = MotionEvaluation.NextVersion();
+            var evaluation = BeginEvaluation(denseIndex);
+            dataRef.Update<TAdapter>(time, out var result);
+
+            // As in v2.0.2, the managed entry is read after the evaluation: the adapter may have grown the storage (new arrays).
+            ref var managedData = ref managedDataArray[denseIndex];
+            Dispatch(new EvaluatedDispatch(MotionEvaluationEntry.SetTime, evaluation, bindAlways), denseIndex, ref dataRef, ref managedData, result);
+        }
+
+        /// <summary>
+        /// [fork] Publishes one completed job. Only the first count entries have an output.
+        /// </summary>
+        /// <param name="evaluationVersion">Version given by the job to the motions it evaluated.</param>
+        /// <remarks>
+        /// Whether the motion is guarded is read from the current arrays, not from the arrays the runner read before the batch:
+        /// a callback of an earlier motion of the batch may have reallocated them, or made this motion guarded. A motion that is
+        /// not guarded is dispatched exactly as in v2.0.2 (with the arrays of the runner).
+        /// </remarks>
+        public unsafe void DispatchRunnerResults(MotionData<TValue, TOptions>* data, TValue* output, int count, uint evaluationVersion)
+        {
+            Dispatch(default(RunnerBatchDispatch), 0, new Span<MotionData<TValue, TOptions>>(data, count),
+                managedDataArray, new ReadOnlySpan<TValue>(output, count), evaluationVersion);
+        }
+
+        void DispatchGuardedRunnerResult(int denseIndex, uint evaluationVersion, TValue result)
+        {
+            // The evaluation of the job. If a callback of an earlier motion of the batch evaluated this motion again, the output
+            // is stale and that evaluation has already dispatched the events.
+            var evaluation = EvaluationAt(denseIndex, evaluationVersion);
+            if (!IsCurrent(evaluation, ref denseIndex)) return;
+
+            ref var dataRef = ref unmanagedDataArray[denseIndex];
+            ref var managedData = ref managedDataArray[denseIndex];
+            if (!IsEvaluated(dataRef.Core.State.Status)) return;
+
+            var stoppedAtStart = MotionExtensionHooks.StopAtStartWhenPlayingBackwards<TValue, TOptions, TAdapter>(ref dataRef, ref managedData, ref result);
+            Dispatch(new EvaluatedDispatch(MotionEvaluationEntry.Runner, evaluation, stoppedAtStart), denseIndex, ref dataRef, ref managedData, result);
+        }
+
+        /// <summary>
+        /// [fork] Binds the value of an evaluation and invokes the lifecycle callbacks (OnLoopComplete, OnComplete).
+        /// This is the single implementation of what UpdateRunner.Update, SetTime and TryCompleteCore did separately in v2.0.2;
+        /// the rules that differed between them are kept as they were (see <see cref="IMotionDispatch"/>). Each rule applies when the
+        /// dispatch reaches its stage:
+        /// <list type="bullet">
+        /// <item><description>Motion no longer evaluated (canceled after its evaluation, by the adapter or by an earlier callback of the
+        /// runner batch): Runner and SetTime dispatch nothing; Complete goes on.</description></item>
+        /// <item><description>Value bound: Runner and SetTime when Playing, Completed, or Delayed without SkipValuesDuringDelay;
+        /// Complete in every case.</description></item>
+        /// <item><description>Exception in the bind with CancelOnError: Runner cancels and still invokes OnLoopComplete/OnComplete;
+        /// SetTime cancels and stops; Complete does not cancel. OnCancel is invoked unguarded (its exceptions propagate).</description></item>
+        /// <item><description>OnLoopComplete: Runner when the loop count advanced (decided before the bind); SetTime only if the value was bound;
+        /// Complete when the loop count advanced.</description></item>
+        /// <item><description>OnComplete: Runner and SetTime when the motion has just completed; Complete in every case, so a plain
+        /// explicit Complete() also completes a motion that the adapter canceled, as in v2.0.2.</description></item>
+        /// </list>
+        /// Motions that use a fork extension get a guarded evaluation (<see cref="MotionEvaluation.IsGuarded"/>): OnStart is invoked first,
+        /// a guarded sequence dispatches its callbacks even when its value is not bound, and the evaluation is checked (see
+        /// <see cref="IsCurrent"/>) before the bind and after each later piece of user code up to OnLoopComplete. Once user code has
+        /// superseded it (canceled, completed or evaluated the motion again, or removed it), the dispatch stops at the next check
+        /// and reaches no later stage, whatever the entry.
+        /// Other motions are dispatched exactly as in v2.0.2.
+        /// </summary>
+        bool Dispatch(EvaluatedDispatch dispatch, int denseIndex, ref MotionData<TValue, TOptions> data, ref ManagedMotionData managed, TValue result)
+        {
+            // A single evaluation runs the loop body of the runner batch as a batch of one, so the rules exist only once.
+            return Dispatch(dispatch, denseIndex, MemoryMarshal.CreateSpan(ref data, 1),
+                MemoryMarshal.CreateSpan(ref managed, 1), MemoryMarshal.CreateReadOnlySpan(ref result, 1), 0);
+        }
+
+        // [fork] The loop body shared by the runner batch and the single evaluations (Runner, SetTime, Complete). A guarded result
+        // of the runner batch leaves the batch and comes back as a single evaluation (DispatchGuardedRunnerResult).
+        bool Dispatch<TDispatch>(TDispatch dispatch, int denseIndex, Span<MotionData<TValue, TOptions>> data,
+            Span<ManagedMotionData> bindings, ReadOnlySpan<TValue> results, uint evaluationVersion)
+            where TDispatch : struct, IMotionDispatch
+        {
+            for (var i = 0; i < results.Length; i++)
             {
-                var dataPtr = arrayPtr + denseIndex;
-                ref var state = ref dataPtr->Core.State;
-
-                if (checkIsInSequence && state.IsInSequence) Error.MotionIsInSequence();
-
-                dataPtr->Update<TAdapter>(time, out var result);
-
-                var status = state.Status;
-                ref var managedData = ref managedDataArray[denseIndex];
-
-                if (status is MotionStatus.Playing or MotionStatus.Completed || (status == MotionStatus.Delayed && !managedData.SkipValuesDuringDelay))
+                ref var dataRef = ref data[i];
+                ref var managedData = ref bindings[i];
+                ref readonly var result = ref results[i];
+                if (dispatch.IsRunnerBatch)
                 {
-                    try
+                    if (dataRef.Core.State.IsInSequence) continue;
+                    if (managedDataArray[i].Extension.IsGuarded)
                     {
-                        managedData.UpdateUnsafe(result);
+                        DispatchGuardedRunnerResult(i, evaluationVersion, result);
+                        continue;
                     }
-                    catch (Exception ex)
+                }
+
+                var status = dataRef.Core.State.Status;
+                if (!IsEvaluated(status) && !dispatch.AlwaysCompletes)
+                {
+                    if (dispatch.IsRunnerBatch) continue;
+                    return false;
+                }
+
+                var isCompleted = status == MotionStatus.Completed;
+                if (dispatch.IsGuarded)
+                {
+                    if (!BeginGuardedDispatch(dispatch.Evaluation, ref denseIndex, isCompleted)) return false;
+
+                    // A guarded evaluation is checked here (after the adapter and each OnStart callback), then after each later
+                    // piece of user code: the bind, the callbacks of a sequence whose value is not bound, OnLoopComplete.
+                    // After each check the refs are taken again: the motion may have moved, or the arrays may have been reallocated.
+                    // A method cannot re-point the caller's ref locals (C# 9), so these two lines follow each check;
+                    // spans and an index would allow a single call, but made the runner about 10% slower on large batches.
+                    dataRef = ref unmanagedDataArray[denseIndex];
+                    managedData = ref managedDataArray[denseIndex];
+                }
+
+                var loopCompletedBeforeBind = dispatch.DecidesLoopBeforeBind && dataRef.Core.State.WasLoopCompleted;
+
+                if (dispatch.AlwaysBinds || status != MotionStatus.Delayed || !managedData.SkipValuesDuringDelay)
+                {
+                    if (!TryBind(ref managedData, result))
                     {
-                        MotionDispatcher.GetUnhandledExceptionHandler()?.Invoke(ex);
-                        if (managedData.CancelOnError)
+                        if (dispatch.IsGuarded)
                         {
-                            state.Status = MotionStatus.Canceled;
+                            if (!IsCurrent(dispatch.Evaluation, ref denseIndex)) return false;
+                            dataRef = ref unmanagedDataArray[denseIndex];
+                            managedData = ref managedDataArray[denseIndex];
+                        }
+
+                        if (dispatch.CancelsOnError && managedData.CancelOnError)
+                        {
+                            dataRef.Core.State.Status = MotionStatus.Canceled;
                             managedData.OnCancelAction?.Invoke();
-                            return;
+                            if (dispatch.StopsAfterCancel) return false;
                         }
                     }
 
-                    if (state.WasLoopCompleted)
+                    if (dispatch.IsGuarded)
                     {
-                        managedData.InvokeOnLoopComplete(state.CompletedLoops);
-                    }
-
-                    if (status is MotionStatus.Completed && state.WasStatusChanged)
-                    {
-                        managedData.InvokeOnComplete();
+                        if (!IsCurrent(dispatch.Evaluation, ref denseIndex)) return false;
+                        dataRef = ref unmanagedDataArray[denseIndex];
+                        managedData = ref managedDataArray[denseIndex];
+                        if (isCompleted) EndCompletionHold(ref managedData, ref dataRef.Core.State);
                     }
                 }
+                else
+                {
+                    if (dispatch.IsGuarded && MotionExtensionHooks.DispatchSequenceCallbacksWithoutBinding(ref managedData))
+                    {
+                        if (!IsCurrent(dispatch.Evaluation, ref denseIndex)) return false;
+                        dataRef = ref unmanagedDataArray[denseIndex];
+                        managedData = ref managedDataArray[denseIndex];
+                    }
+
+                    if (dispatch.StopsWhenNotBound) return false;
+                }
+
+                if (dispatch.DecidesLoopBeforeBind ? loopCompletedBeforeBind : dataRef.Core.State.WasLoopCompleted)
+                {
+                    managedData.InvokeOnLoopComplete(dataRef.Core.State.CompletedLoops);
+                    if (dispatch.IsGuarded)
+                    {
+                        if (!IsCurrent(dispatch.Evaluation, ref denseIndex)) return false;
+                        dataRef = ref unmanagedDataArray[denseIndex];
+                        managedData = ref managedDataArray[denseIndex];
+                    }
+                }
+
+                if (dispatch.AlwaysCompletes || (isCompleted && dataRef.Core.State.WasStatusChanged))
+                {
+                    managedData.InvokeOnComplete();
+                }
             }
+
+            return true;
+        }
+
+        // [fork] Keep the exception region around one binding. A try/catch inside the batch loop is costly on Mono.
+        // Dispatch applies the entry-specific cancellation policy after the exception handler returns.
+        static bool TryBind(ref ManagedMotionData managedData, in TValue value)
+        {
+            try
+            {
+                managedData.UpdateUnsafe(value);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                MotionDispatcher.GetUnhandledExceptionHandler()?.Invoke(ex);
+                return false;
+            }
+        }
+
+        // [fork] Only guarded evaluations run this preparation before the bind:
+        // - the evaluation stops if user code in the adapter superseded it;
+        // - the completion reached by the evaluation is published after the user code that belongs to the frame before it:
+        //   OnStart, and the update of a guarded sequence (its last callbacks and children). Meanwhile the motion is Playing,
+        //   so that this code can still cancel it (as in Complete()). For a sequence the hold lasts until after the bind
+        //   (EndCompletionHold).
+        bool BeginGuardedDispatch(in MotionEvaluation evaluation, ref int denseIndex, bool isCompleted)
+        {
+            if (!IsCurrent(evaluation, ref denseIndex)) return false;
+
+            var holdDuringBind = isCompleted && managedDataArray[denseIndex].Extension.IsGuardedSequence;
+            if (MotionExtensionHooks.IsStartDue(ref unmanagedDataArray[denseIndex].Core, ref managedDataArray[denseIndex]))
+            {
+                if (isCompleted) unmanagedDataArray[denseIndex].Core.State.Status = MotionStatus.Playing;
+                if (!InvokeOnStart(evaluation, ref denseIndex)) return false;
+                if (isCompleted && !holdDuringBind) unmanagedDataArray[denseIndex].Core.State.Status = MotionStatus.Completed;
+            }
+            else if (holdDuringBind)
+            {
+                unmanagedDataArray[denseIndex].Core.State.Status = MotionStatus.Playing;
+            }
+
+            if (holdDuringBind) MotionExtensionHooks.HoldCompletion(evaluation);
+            return true;
+        }
+
+        // [fork] After the bind of a guarded evaluation that reached the completion: see BeginGuardedDispatch.
+        static void EndCompletionHold(ref ManagedMotionData managedData, ref MotionData.MotionState state)
+        {
+            if (!managedData.Extension.IsGuardedSequence) return;
+            MotionExtensionHooks.ReleaseCompletionHold();
+            if (state.Status == MotionStatus.Playing) state.Status = MotionStatus.Completed;
+        }
+
+        // [fork] Invokes the OnStart callbacks of a guarded evaluation one by one. Returns false if one of them superseded it.
+        bool InvokeOnStart(in MotionEvaluation evaluation, ref int denseIndex)
+        {
+            var onStart = MotionExtensionHooks.TakeOnStart(ref managedDataArray[denseIndex]);
+            var count = MotionStartCallbacks.GetCount(onStart);
+            for (int i = 0; i < count; i++)
+            {
+                MotionExtensionHooks.InvokeCallback(MotionStartCallbacks.GetAt(onStart, i));
+                if (!IsCurrent(evaluation, ref denseIndex)) return false;
+            }
+            return true;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static bool IsEvaluated(MotionStatus status)
+        {
+            return status is MotionStatus.Delayed or MotionStatus.Playing or MotionStatus.Completed;
+        }
+
+        // [fork] A guarded evaluation for the guarded motions, an unguarded one for the others.
+        // The current evaluation version of the motion is the one of this evaluation (set by SetTime or Complete just before).
+        MotionEvaluation BeginEvaluation(int denseIndex)
+        {
+            if (!managedDataArray[denseIndex].Extension.IsGuarded) return default;
+            return EvaluationAt(denseIndex, unmanagedDataArray[denseIndex].Core.State.EvaluationVersion);
+        }
+
+        // [fork]
+        MotionEvaluation EvaluationAt(int denseIndex, uint evaluationVersion)
+        {
+            var sparseIndex = sparseIndexLookup[denseIndex];
+            return new MotionEvaluation(Id, sparseIndex.Index, sparseIndex.Version, generation, evaluationVersion);
+        }
+
+        /// <summary>
+        /// [fork] The current evaluation of a valid motion, for code outside the dispatch that runs user code on its behalf
+        /// (the updates of a sequence).
+        /// </summary>
+        public MotionEvaluation CaptureEvaluation(MotionHandle handle)
+        {
+            ref var slot = ref GetSlotWithVarify(handle, false);
+            return EvaluationAt(slot.DenseIndex, unmanagedDataArray[slot.DenseIndex].Core.State.EvaluationVersion);
+        }
+
+        /// <summary>
+        /// [fork] See <see cref="IsCurrent(in MotionEvaluation, ref int)"/>. An unguarded evaluation is always current.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool IsCurrent(in MotionEvaluation evaluation)
+        {
+            if (!evaluation.IsGuarded) return true;
+            var denseIndex = 0;
+            return IsCurrent(evaluation, ref denseIndex);
+        }
+
+        // [fork] Whether a guarded evaluation is still current after user code: the motion still exists (same slot, no reset)
+        // and has not been evaluated again or canceled since. Updates denseIndex to the current position of the motion;
+        // the caller must re-read the motion (the arrays may have been reallocated).
+        bool IsCurrent(in MotionEvaluation evaluation, ref int denseIndex)
+        {
+            if (evaluation.StorageGeneration != generation) return false;
+            if (evaluation.SlotIndex < 0 || evaluation.SlotIndex >= sparseSetCore.Capacity) return false;
+
+            ref var slot = ref sparseSetCore.GetSlotRefUnchecked(evaluation.SlotIndex);
+            if (slot.Version != evaluation.SlotVersion || IsDenseIndexOutOfRange(slot.DenseIndex)) return false;
+            if (unmanagedDataArray[slot.DenseIndex].Core.State.EvaluationVersion != evaluation.Version) return false;
+
+            denseIndex = slot.DenseIndex;
+            return true;
         }
 
         public void AddToSequence(MotionHandle handle, out double motionDuration)
@@ -448,10 +744,11 @@ namespace LitMotion
             return ref managedDataArray[slot.DenseIndex];
         }
 
-        public ref MotionData GetDataRef(MotionHandle handle, bool checkIsInSequence = true)
+        public ref MotionData GetDataRef(in MotionHandle handle, bool checkIsInSequence = true)
         {
-            ref var slot = ref GetSlotWithVarify(handle, checkIsInSequence);
-            return ref UnsafeUtility.As<MotionData<TValue, TOptions>, MotionData>(ref unmanagedDataArray[slot.DenseIndex]);
+            // [fork] Reuse the validated data address, including for direct PlaybackSpeed assignments.
+            ref var slot = ref sparseSetCore.GetSlotRefUnchecked(handle.Index);
+            return ref GetVerifiedData(handle, in slot, checkIsInSequence).Core;
         }
 
         public MotionDebugInfo GetDebugInfo(MotionHandle handle)
@@ -467,34 +764,36 @@ namespace LitMotion
             };
         }
 
+        // [fork] The checks are in GetVerifiedData, which also returns the data: GetDataRef needs a single lookup.
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         ref SparseSetCore.Slot GetSlotWithVarify(MotionHandle handle, bool checkIsInSequence = true)
         {
             ref var slot = ref sparseSetCore.GetSlotRefUnchecked(handle.Index);
-            if (IsDenseIndexOutOfRange(slot.DenseIndex)) Error.MotionNotExists();
-
-            ref var dataRef = ref unmanagedDataArray[slot.DenseIndex];
-
-            if (IsInvalidVersion(slot.Version, handle) || dataRef.Core.State.Status == MotionStatus.None)
-            {
-                Error.MotionNotExists();
-            }
-
-            if (checkIsInSequence && dataRef.Core.State.IsInSequence)
-            {
-                Error.MotionIsInSequence();
-            }
-
+            GetVerifiedData(handle, in slot, checkIsInSequence);
             return ref slot;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        ref MotionData<TValue, TOptions> GetVerifiedData(in MotionHandle handle, in SparseSetCore.Slot slot, bool checkIsInSequence)
+        {
+            var denseIndex = slot.DenseIndex;
+            if (IsDenseIndexOutOfRange(denseIndex)) Error.MotionNotExists();
+
+            ref var data = ref unmanagedDataArray[denseIndex];
+            if (IsInvalidVersion(slot.Version, handle) || data.Core.State.Status == MotionStatus.None) Error.MotionNotExists();
+            if (checkIsInSequence && data.Core.State.IsInSequence) Error.MotionIsInSequence();
+            return ref data;
         }
 
         public void Reset()
         {
+            for (int i = 0; i < tail; i++) MotionExtensionHooks.OnRemoved(ref managedDataArray[i]); // [fork]
             sparseSetCore.Reset();
             sparseIndexLookup.AsSpan().Clear();
             unmanagedDataArray.AsSpan().Clear();
             managedDataArray.AsSpan().Clear();
             tail = 0;
+            generation++; // [fork]
             allocator.Allocator.Rewind();
         }
 

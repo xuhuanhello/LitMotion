@@ -22,6 +22,7 @@ namespace LitMotion
             {
                 ArrayPool<MotionSequenceItem>.Shared.Return(source.buffer);
             }
+            source.ReleaseCallbacks(); // [fork]
 
             source.version++;
             source.buffer = null;
@@ -44,10 +45,16 @@ namespace LitMotion
         double lastTail;
         double duration;
 
+        // [fork] Sequence callbacks (SequenceCallbackExtensions) and guarded children.
+        MotionSequenceCallback[] callbackBuffer;
+        int callbackCount;
+        bool hasGuardedChildren;
+
         public void Append(MotionHandle handle)
         {
             MotionManager.AddToSequence(handle, out var motionDuration);
             AddItem(new MotionSequenceItem(tail, handle));
+            OnChildAdded(handle); // [fork]
             AppendInterval(motionDuration);
         }
 
@@ -62,6 +69,7 @@ namespace LitMotion
         {
             MotionManager.AddToSequence(handle, out var motionDuration);
             AddItem(new MotionSequenceItem(position, handle));
+            OnChildAdded(handle); // [fork]
             duration = Math.Max(duration, position + motionDuration);
         }
 
@@ -81,6 +89,7 @@ namespace LitMotion
             var handle = builder.Bind(source, (x, source) => source.Time = x);
 
             source.Initialize(handle, buffer, count, duration);
+            TransferCallbacks(source); // [fork]
             buffer = null;
             return handle;
         }
@@ -102,6 +111,74 @@ namespace LitMotion
 
             buffer[count] = item;
             count++;
+        }
+
+        // [fork] Sequence callbacks and guarded children, down to the end of the class.
+        public void AppendCallback(Action callback)
+        {
+            AddCallback(tail, callback);
+
+            // Like Append/AppendInterval, the callback becomes the last added item, so a following Join()
+            // is inserted at the callback position. The tail itself does not move.
+            AppendInterval(0);
+        }
+
+        public void InsertCallback(double position, Action callback)
+        {
+            AddCallback(position, callback);
+            duration = Math.Max(duration, position);
+        }
+
+        void AddCallback(double position, Action callback)
+        {
+            if (callbackBuffer == null)
+            {
+                callbackBuffer = ArrayPool<MotionSequenceCallback>.Shared.Rent(8);
+            }
+            else if (callbackBuffer.Length == callbackCount)
+            {
+                var newBuffer = ArrayPool<MotionSequenceCallback>.Shared.Rent(callbackCount * 2);
+                callbackBuffer.AsSpan(0, callbackCount).CopyTo(newBuffer);
+                MotionSequenceCallback.ReturnBuffer(callbackBuffer, callbackCount);
+                callbackBuffer = newBuffer;
+            }
+
+            // Keep the buffer sorted by position. Callbacks at the same position keep the order they were added in.
+            var index = callbackCount;
+            while (index > 0 && callbackBuffer[index - 1].Position > position)
+            {
+                callbackBuffer[index] = callbackBuffer[index - 1];
+                index--;
+            }
+
+            callbackBuffer[index] = new MotionSequenceCallback { Position = position, Callback = callback };
+            callbackCount++;
+        }
+
+        // Called by Append()/Insert() once the child has been added: a sequence that contains a child using a fork extension
+        // (OnStart, sequence callbacks) is evaluated with the same guards as that child.
+        void OnChildAdded(MotionHandle handle)
+        {
+            if (MotionManager.GetManagedDataRef(handle, false).Extension.IsGuarded) hasGuardedChildren = true;
+        }
+
+        // Called by Schedule() after the sequence motion has been created. The source decides whether the sequence is guarded
+        // (callbacks, a guarded child, or a guarded motion); a sequence that is not keeps the original behavior.
+        void TransferCallbacks(MotionSequenceSource source)
+        {
+            source.SetCallbacks(callbackBuffer, callbackCount, hasGuardedChildren);
+            callbackBuffer = null;
+            callbackCount = 0;
+            hasGuardedChildren = false;
+        }
+
+        void ReleaseCallbacks()
+        {
+            hasGuardedChildren = false;
+            if (callbackBuffer == null) return;
+            MotionSequenceCallback.ReturnBuffer(callbackBuffer, callbackCount);
+            callbackBuffer = null;
+            callbackCount = 0;
         }
     }
 
@@ -172,7 +249,7 @@ namespace LitMotion
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        readonly void CheckIsDisposed()
+        internal readonly void CheckIsDisposed() // [fork] internal: also used by AppendCallback/InsertCallback
         {
             if (source == null || source.Version != version)
             {

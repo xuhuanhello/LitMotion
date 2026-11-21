@@ -20,7 +20,7 @@ namespace LitMotion
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static ref MotionData GetDataRef(MotionHandle handle, bool checkIsInSequence = true)
+        public static ref MotionData GetDataRef(in MotionHandle handle, bool checkIsInSequence = true) // [fork] avoid copying the handle on each lookup
         {
             CheckTypeId(handle);
             return ref list[handle.StorageId].GetDataRef(handle, checkIsInSequence);
@@ -94,6 +94,41 @@ namespace LitMotion
         {
             CheckTypeId(handle);
             list[handle.StorageId].SetTime(handle, time, checkIsInSequence);
+        }
+
+        // [fork] IsValid for the public entry points of the fork: also false, instead of an exception, for a handle whose index
+        // is out of the range of the slots. (IsValid itself keeps the behavior of v2.0.2.)
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsValidHandle(MotionHandle handle)
+        {
+            if (handle.StorageId < 0 || handle.StorageId >= MotionTypeCount) return false;
+            var storage = list[handle.StorageId];
+            return storage.HasSlot(handle.Index) && storage.IsValid(handle);
+        }
+
+        // [fork] See MotionStorage.StopAtStart.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static void StopAtStart(MotionHandle handle)
+        {
+            CheckTypeId(handle);
+            list[handle.StorageId].StopAtStart(handle);
+        }
+
+        // [fork] See MotionEvaluation.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static MotionEvaluation CaptureEvaluation(MotionHandle handle)
+        {
+            CheckTypeId(handle);
+            return list[handle.StorageId].CaptureEvaluation(handle);
+        }
+
+        // [fork] See MotionEvaluation.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public static bool IsCurrent(in MotionEvaluation evaluation)
+        {
+            if (!evaluation.IsGuarded) return true;
+            if (evaluation.StorageId < 0 || evaluation.StorageId >= MotionTypeCount) return false;
+            return list[evaluation.StorageId].IsCurrent(evaluation);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]

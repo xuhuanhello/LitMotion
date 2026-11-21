@@ -25,6 +25,7 @@ namespace LitMotion
         public Action<int> OnLoopCompleteAction;
         public Action OnCompleteAction;
         public Action OnCancelAction;
+        internal MotionExtensionData Extension; // [fork] see MotionExtensionData.cs
 
 #if LITMOTION_DEBUG
         public string DebugName;

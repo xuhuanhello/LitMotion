@@ -56,6 +56,7 @@ namespace LitMotion
             buffer.OnLoopCompleteAction = default;
             buffer.OnCompleteAction = default;
             buffer.OnCancelAction = default;
+            buffer.OnStartAction = default; // [fork] see MotionStartCallbackExtensions.cs
 
             buffer.CancelOnError = default;
             buffer.SkipValuesDuringDelay = default;
@@ -97,6 +98,7 @@ namespace LitMotion
         public Action<int> OnLoopCompleteAction;
         public Action OnCompleteAction;
         public Action OnCancelAction;
+        public Action OnStartAction; // [fork] see MotionStartCallbackExtensions.cs
         public AnimationCurve AnimationCurve;
         public IMotionScheduler Scheduler;
 
@@ -496,7 +498,7 @@ namespace LitMotion
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        readonly void CheckBuffer()
+        internal readonly void CheckBuffer() // [fork] internal: also used by WithOnStart
         {
             if (buffer == null || buffer.Version != version) throw new InvalidOperationException("MotionBuilder is either not initialized or has already run a Build (or Bind).");
         }
